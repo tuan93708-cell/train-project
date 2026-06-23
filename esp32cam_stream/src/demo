@@ -1,0 +1,239 @@
+import cv2
+import time
+
+# ==========================
+# ESP32-CAM STREAM
+# ==========================
+
+URL = "http://192.168.123.138/stream"
+
+# ==========================
+# ROI CẢNH BÁO
+# ==========================
+
+ROI_X = 320
+ROI_Y = 80
+
+ROI_W = 220
+ROI_H = 120
+
+# ==========================
+# MOG2
+# ==========================
+
+bg = cv2.createBackgroundSubtractorMOG2(
+    history=300,
+    varThreshold=30,
+    detectShadows=False
+)
+
+state = "NO TRAIN"
+
+# ==========================
+# CONNECT CAMERA
+# ==========================
+
+cap = cv2.VideoCapture(URL)
+
+if not cap.isOpened():
+    print("Khong ket noi duoc ESP32-CAM")
+    exit()
+
+print("ESP32-CAM Connected")
+
+# ==========================
+# LOOP
+# ==========================
+
+while True:
+
+    ret, frame = cap.read()
+
+    # ----------------------
+    # AUTO RECONNECT
+    # ----------------------
+
+    if not ret:
+
+        print("Mat ket noi -> Reconnect")
+
+        cap.release()
+
+        time.sleep(2)
+
+        cap = cv2.VideoCapture(URL)
+
+        continue
+
+    # ----------------------
+    # RESIZE
+    # ----------------------
+
+    frame = cv2.resize(frame, (640, 480))
+
+    # ----------------------
+    # ROI
+    # ----------------------
+
+    roi = frame[
+        ROI_Y:ROI_Y + ROI_H,
+        ROI_X:ROI_X + ROI_W
+    ]
+
+    if roi.size == 0:
+        continue
+
+    # ----------------------
+    # GRAY
+    # ----------------------
+
+    gray = cv2.cvtColor(
+        roi,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (5, 5),
+        0
+    )
+
+    # ----------------------
+    # MOTION DETECTION
+    # ----------------------
+
+    mask = bg.apply(gray)
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (5, 5)
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    mask = cv2.dilate(
+        mask,
+        None,
+        iterations=2
+    )
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    detected = False
+    biggest_area = 0
+
+    for cnt in contours:
+
+        area = cv2.contourArea(cnt)
+
+        if area < 1200:
+            continue
+
+        detected = True
+
+        if area > biggest_area:
+            biggest_area = area
+
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        cv2.rectangle(
+            frame,
+            (x + ROI_X, y + ROI_Y),
+            (x + ROI_X + w, y + ROI_Y + h),
+            (255, 0, 0),
+            2
+        )
+
+    # ----------------------
+    # STATE MACHINE
+    # ----------------------
+
+    if detected:
+
+        if state == "NO TRAIN":
+
+            state = "TRAIN APPROACHING"
+
+            print("🚨 TÀU ĐANG TỚI")
+
+        color = (0, 0, 255)
+
+    else:
+
+        if state == "TRAIN APPROACHING":
+
+            state = "TRAIN PASSED"
+
+            print("✅ TÀU ĐÃ ĐI QUA")
+
+        color = (0, 255, 0)
+
+    # ----------------------
+    # DRAW ROI
+    # ----------------------
+
+    cv2.rectangle(
+        frame,
+        (ROI_X, ROI_Y),
+        (ROI_X + ROI_W,
+         ROI_Y + ROI_H),
+        color,
+        3
+    )
+
+    # ----------------------
+    # TEXT
+    # ----------------------
+
+    cv2.putText(
+        frame,
+        state,
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        color,
+        3
+    )
+
+    cv2.putText(
+        frame,
+        f"Area: {int(biggest_area)}",
+        (20, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 0),
+        2
+    )
+
+    # ----------------------
+    # SHOW
+    # ----------------------
+
+    cv2.imshow(
+        "Railway Crossing Monitor",
+        frame
+    )
+
+    cv2.imshow(
+        "ROI Motion",
+        mask
+    )
+
+    # giảm tải ESP32
+    time.sleep(0.03)
+
+    key = cv2.waitKey(1)
+
+    if key == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
