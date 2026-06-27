@@ -3,6 +3,7 @@
 #include <WebServer.h>
 #include <ESP32Servo.h>
 #include <time.h>
+#include <PubSubClient.h>
 
 
 //======================================================
@@ -60,6 +61,25 @@ WebServer server(80);
 // BUZZER
 #define BUZZER 23
 
+//======================================================
+// MQTT CONFIG
+//======================================================
+const char* mqtt_server = "192.168.123.37"; // IP máy tính trung tâm
+const int mqtt_port = 1883;
+const char* mqtt_topic_status = "railway/crossing/status";
+const char* mqtt_topic_error = "railway/crossing/error";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_INTERVAL = 10000;
+String lastStatusStr = "";
+
+unsigned long lastColdTestTime = 0;
+const unsigned long COLD_TEST_INTERVAL = 10000; // Giảm xuống 10s để test dễ hơn
+
+unsigned long noTrainSince = 0; // Thời điểm hệ thống chuyển sang NO_TRAIN
+
 
 //======================================================
 // SERVO
@@ -71,12 +91,16 @@ Servo barrier2;
 
 //======================================================
 // SYSTEM MODE
+// AUTO_MODE      : Tự động hoàn toàn
+// FAIL_SAFE_MODE : Khi có lỗi – barrier đóng, cảnh báo
+// ERROR_CHECK_MODE: Sau khi nhấn Reset – kiểm tra tay trước khi trở lại AUTO
 //======================================================
 
 enum SystemMode
 {
   AUTO_MODE,
-  MANUAL_MODE
+  FAIL_SAFE_MODE,
+  ERROR_CHECK_MODE
 };
 
 
@@ -170,8 +194,8 @@ unsigned long pendingCloseStart = 0;
 // IR1 must remain active for this long before we accept it as a true train detection.
 const unsigned long IR1_DETECT_CONFIRM_MS = 100;
 
-// If IR1 triggered but IR2 never sees the train, return to safe state after this timeout.
-const unsigned long TRAIN_ABORT_TIMEOUT_MS = 20000;
+// Nếu IR1 phát hiện nhưng IR2 mãi không thấy (báo động giả), hủy sau khoảng thời gian này (5 phút)
+const unsigned long TRAIN_ABORT_TIMEOUT_MS = 300000;
 
 unsigned long ir1DetectStart = 0;
 
@@ -199,7 +223,7 @@ unsigned long ir2ActiveTime = 0;
 
 
 //======================================================
-// TRẠNG THÁI ĐIỀU KHIỂN TAY
+// TRẠNG THÁI ĐIỀU KHIỂN KIỂM TRA LỖI
 //======================================================
 
 bool manualBuzzer = false;
@@ -216,7 +240,7 @@ void setError(String message)
 {
   systemError = true;
 
-  mode = MANUAL_MODE;
+  mode = FAIL_SAFE_MODE;
 
   errorMessage = message;
 
@@ -249,8 +273,14 @@ void setError(String message)
   Serial.println("========================");
   Serial.println(" SYSTEM ERROR ");
   Serial.println(message);
-  Serial.println(" SWITCH TO FAIL-SAFE MODE ");
+  Serial.println(" SWITCH TO ERROR CHECK MODE ");
   Serial.println("========================");
+
+  // Push error to MQTT
+  if (mqttClient.connected()) {
+    String errorPayload = "{\"STATUS\":\"🚨 HỆ THỐNG LỖI 🚨\",\"ERROR\":\"" + message + "\",\"alert\":\"CRITICAL\",\"action_required\":true,\"timestamp\":" + String(time(NULL)) + "}";
+    mqttClient.publish(mqtt_topic_error, errorPayload.c_str(), true);
+  }
 }
 //======================================================
 // ĐÓNG BARRIER
@@ -386,31 +416,27 @@ void setFailSafeOutputs()
 {
   digitalWrite(BUZZER, HIGH);
 
-  digitalWrite(RED1, HIGH);
-  digitalWrite(RED2, HIGH);
-  digitalWrite(RED3, HIGH);
-  digitalWrite(RED4, HIGH);
+  redBlink();
 
   digitalWrite(YELLOW1, HIGH);
   digitalWrite(YELLOW2, HIGH);
 }
 
 
+// resetError: FAIL_SAFE -> ERROR_CHECK
+// Tắt cảnh báo, mở barrier để kiểm tra – chưa quay lại AUTO
 void resetError()
 {
-  Serial.println("RESET SYSTEM");
+  Serial.println("RESET ERROR -> ENTERING ERROR CHECK MODE");
 
   systemError = false;
-  mode = AUTO_MODE;
+  mode = ERROR_CHECK_MODE;
 
-  errorMessage = "NONE";
-
-  trainState = NO_TRAIN;
-
+  // Giữ errorMessage để người dùng biết lỗi vừa xảy ra
+  // (sẽ xóa khi confirmOK)
 
   manualBuzzer = false;
   manualRedBlink = false;
-
 
   ir1ToggleCount = 0;
   ir2ToggleCount = 0;
@@ -422,14 +448,52 @@ void resetError()
   pendingClose = false;
   pendingCloseStart = 0;
 
+  warningOff();
+  allLedOff();
+  openBarrier();
+
+  Serial.println("SYSTEM IN ERROR CHECK MODE – VERIFY THEN PRESS CONFIRM OK");
+
+  // Thông báo MQTT vào chế độ kiểm tra
+  if (mqttClient.connected()) {
+    String errorPayload = "{\"STATUS\":\"⚠️ CHỜ KIỂM TRA ⚠️\",\"ERROR\":\"ERROR_CHECK\",\"alert\":\"WARNING\",\"action_required\":true}";
+    mqttClient.publish(mqtt_topic_error, errorPayload.c_str(), true);
+  }
+}
+
+// confirmOK: ERROR_CHECK -> AUTO
+// Gọi khi người dùng đã kiểm tra xong và xác nhận hệ thống OK
+void confirmOK()
+{
+  Serial.println("CONFIRM OK -> BACK TO AUTO MODE");
+
+  mode = AUTO_MODE;
+  errorMessage = "NONE";
+
+  trainState = NO_TRAIN;
+  noTrainSince = millis();
+
+  manualBuzzer = false;
+  manualRedBlink = false;
+
+  ir1ToggleCount = 0;
+  ir2ToggleCount = 0;
+  ir1ActiveTime = 0;
+  ir2ActiveTime = 0;
+
+  pendingClose = false;
+  pendingCloseStart = 0;
 
   warningOff();
-
   allLedOff();
-
   openBarrier();
 
   Serial.println("SYSTEM BACK TO AUTO MODE");
+
+  if (mqttClient.connected()) {
+    String errorPayload = "{\"STATUS\":\"✅ BÌNH THƯỜNG ✅\",\"ERROR\":\"NONE\",\"alert\":\"OK\",\"action_required\":false}";
+    mqttClient.publish(mqtt_topic_error, errorPayload.c_str(), true);
+  }
 }
 
 //======================================================
@@ -495,7 +559,9 @@ void checkBothIR(int ir1, int ir2)
 {
   if(ir1 == LOW && ir2 == LOW)
   {
-    setError("BOTH IR DETECTED");
+    // Tạm thời tắt báo lỗi này vì trong thực tế, nếu tàu dài hơn khoảng cách
+    // giữa 2 cảm biến IR thì việc cả 2 IR cùng LOW là hoàn toàn bình thường.
+    // setError("BOTH IR DETECTED");
   }
 }
 
@@ -529,13 +595,13 @@ void checkIRToggle(int ir1, int ir2)
   }
 
 
-  if(ir1ToggleCount >= 5)
+  if(ir1ToggleCount >= 7)
   {
     setError("IR1 UNSTABLE");
   }
 
 
-  if(ir2ToggleCount >= 5)
+  if(ir2ToggleCount >= 10)
   {
     setError("IR2 UNSTABLE");
   }
@@ -661,10 +727,13 @@ String getBarrierStatus(BarrierState state)
 
 String getMode()
 {
-  if(mode == AUTO_MODE)
-    return "AUTO";
-
-  return "MANUAL";
+  switch(mode)
+  {
+    case AUTO_MODE:        return "AUTO";
+    case FAIL_SAFE_MODE:   return "FAIL SAFE";
+    case ERROR_CHECK_MODE: return "ERROR CHECK";
+  }
+  return "UNKNOWN";
 }
 
 String getGateStatus()
@@ -909,10 +978,28 @@ color:white;
 }
 
 .error{
-
 color:#ff3333;
 font-weight:bold;
+}
 
+.mode-auto    { color:#00ff88; font-weight:bold; }
+.mode-failsafe{ color:#ff3333; font-weight:bold; animation:blink 0.6s step-end infinite; }
+.mode-check   { color:#ffcc00; font-weight:bold; }
+
+@keyframes blink{ 50%{ opacity:0; } }
+
+.confirm-btn{
+  width:220px;
+  height:48px;
+  margin:10px;
+  border:none;
+  border-radius:8px;
+  font-weight:bold;
+  font-size:15px;
+  cursor:pointer;
+  background:#00cc44;
+  color:#fff;
+  display:none;
 }
 
 
@@ -1072,9 +1159,27 @@ NONE</div>
 </div>
 
 
-<h2>
-MANUAL CONTROL
-</h2>
+<div id="modeSection">
+
+<div id="errorCheckPanel" style="display:none;">
+<h2 style="color:#ffcc00;">&#128269; ERROR CHECK MODE</h2>
+<p style="color:#aaa;font-size:13px;">Ki&#7875;m tra tay xong th&#236; nh&#7845;n X&#225;c nh&#7853;n &#273;&#7875; quay l&#7841;i AUTO</p>
+<a href="/confirmOK"><button class="confirm-btn" id="confirmBtn" style="display:inline-block;">&#10003; X&#193;C NH&#7840;N OK / BACK TO AUTO</button></a>
+<br>
+</div>
+
+<h2 id="controlTitle" style="display:none;">CONTROL</h2>
+
+<div id="resetErrorPanel" style="display:none;">
+<a href="/resetError">
+<button class="warn">
+RESET ERROR
+</button>
+</a>
+<br><br>
+</div>
+
+<div id="manualControls" style="display:none;">
 <a href="/open1">
 <button class="open">
 OPEN BARRIER 1
@@ -1143,16 +1248,6 @@ RED LIGHT OFF
 <br>
 
 
-<a href="/resetError">
-<button class="warn">
-RESET ERROR
-</button>
-</a>
-
-
-<br>
-
-
 <a href="/resetESP">
 <button class="reset">
 RESET ESP32
@@ -1160,6 +1255,7 @@ RESET ESP32
 </a>
 
 <br>
+</div>
 
 <button class="warn" onclick="loadHistory()">
 TIME
@@ -1218,13 +1314,40 @@ document.getElementById("buzzer")
 .innerHTML = data.buzzer;
 
 
-document.getElementById("system")
-.innerHTML = data.system;
+var sysEl = document.getElementById("system");
+sysEl.innerHTML = data.system;
+sysEl.className = "status";
+if(data.system === "AUTO")      sysEl.classList.add("mode-auto");
+else if(data.system === "FAIL SAFE") sysEl.classList.add("mode-failsafe");
+else if(data.system === "ERROR CHECK") sysEl.classList.add("mode-check");
 
+document.getElementById("error").innerHTML = data.error;
 
-document.getElementById("error")
-.innerHTML = data.error;
+// Hiện / ẩn panel kiểm tra lỗi và các nút điều khiển
+var panel = document.getElementById("errorCheckPanel");
+var title = document.getElementById("controlTitle");
+var manualControls = document.getElementById("manualControls");
+var resetErrorPanel = document.getElementById("resetErrorPanel");
 
+if(data.system === "ERROR CHECK") {
+  panel.style.display = "block";
+  manualControls.style.display = "block";
+  resetErrorPanel.style.display = "none";
+  title.style.display = "block";
+  title.textContent = "ERROR CHECK";
+} else if(data.system === "FAIL SAFE") {
+  panel.style.display = "none";
+  manualControls.style.display = "none";
+  resetErrorPanel.style.display = "block";
+  title.style.display = "block";
+  title.textContent = "FAIL SAFE - LOCKED";
+} else {
+  // AUTO_MODE: Ẩn hoàn toàn phần điều khiển
+  panel.style.display = "none";
+  manualControls.style.display = "none";
+  resetErrorPanel.style.display = "none";
+  title.style.display = "none";
+}
 
 });
 
@@ -1272,12 +1395,13 @@ server.send(200,
 
 }
 //======================================================
-// MANUAL BARRIER 1
+// ERROR CHECK - BARRIER 1
 //======================================================
 
 void handleOpen1()
 {
-  if(systemError)
+  // Chỉ cho phép trong ERROR_CHECK_MODE
+  if(mode != ERROR_CHECK_MODE)
   {
     server.sendHeader("Location","/");
     server.send(303);
@@ -1317,12 +1441,13 @@ void handleClose1()
 
 
 //======================================================
-// MANUAL BARRIER 2
+// ERROR CHECK - BARRIER 2
 //======================================================
 
 void handleOpen2()
 {
-  if(systemError)
+  // Chỉ cho phép trong ERROR_CHECK_MODE
+  if(mode != ERROR_CHECK_MODE)
   {
     server.sendHeader("Location","/");
     server.send(303);
@@ -1378,7 +1503,7 @@ void handleBuzzerOn()
 
 void handleBuzzerOff()
 {
-  if(systemError)
+  if(mode == FAIL_SAFE_MODE)
   {
     server.sendHeader("Location","/");
     server.send(303);
@@ -1409,7 +1534,7 @@ void handleRedOn()
 
 void handleRedOff()
 {
-  if(systemError)
+  if(mode == FAIL_SAFE_MODE)
   {
     server.sendHeader("Location","/");
     server.send(303);
@@ -1432,9 +1557,33 @@ void handleRedOff()
 // RESET ERROR
 //======================================================
 
+// Reset lỗi: FAIL_SAFE -> ERROR_CHECK
 void handleResetError()
 {
+  if(mode != FAIL_SAFE_MODE)
+  {
+    server.sendHeader("Location","/");
+    server.send(303);
+    return;
+  }
+
   resetError();
+
+  server.sendHeader("Location","/");
+  server.send(303);
+}
+
+// Xác nhận OK: ERROR_CHECK -> AUTO
+void handleConfirmOK()
+{
+  if(mode != ERROR_CHECK_MODE)
+  {
+    server.sendHeader("Location","/");
+    server.send(303);
+    return;
+  }
+
+  confirmOK();
 
   server.sendHeader("Location","/");
   server.send(303);
@@ -1454,6 +1603,97 @@ void handleResetESP()
 
   ESP.restart();
 }
+//======================================================
+// GIAO TIẾP MQTT & TRUNG TÂM
+//======================================================
+
+void connectMQTT()
+{
+  if (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (mqttClient.connect("ESP32_Railway_Client")) {
+      Serial.println("connected");
+      // Subscribe topics if needed
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+
+void publishStatusToMQTT()
+{
+  if (mqttClient.connected()) {
+    String payload = "{";
+    payload += "\"train\":\"" + getTrainStatus() + "\",";
+    payload += "\"gate\":\"" + getGateStatus() + "\",";
+    payload += "\"system\":\"" + getMode() + "\",";
+    payload += "\"error\":\"" + errorMessage + "\"";
+    payload += "}";
+    
+    mqttClient.publish(mqtt_topic_status, payload.c_str());
+    
+    // Luôn bắn kèm trạng thái error hiện tại lên topic error với cờ retain
+    String alertLevel = (errorMessage == "NONE") ? "OK" : ((mode == ERROR_CHECK_MODE) ? "WARNING" : "CRITICAL");
+    bool actionReq = (errorMessage != "NONE");
+    String statusStr = (errorMessage == "NONE") ? "✅ BÌNH THƯỜNG ✅" : ((mode == ERROR_CHECK_MODE) ? "⚠️ CHỜ KIỂM TRA ⚠️" : "🚨 HỆ THỐNG LỖI 🚨");
+    String errorPayload = "{\"STATUS\":\"" + statusStr + "\",\"ERROR\":\"" + errorMessage + "\",\"alert\":\"" + alertLevel + "\",\"action_required\":" + (actionReq ? "true" : "false") + "}";
+    mqttClient.publish(mqtt_topic_error, errorPayload.c_str(), true);
+    
+    lastHeartbeat = millis();
+  }
+}
+
+//======================================================
+// COLD TEST (KIỂM TRA NGUỘI)
+//======================================================
+
+void runColdTest()
+{
+  Serial.println("RUNNING COLD TEST (INTERNAL PULLUP)...");
+  
+  // Bước 1: Đảm bảo tất cả đèn và còi đang TẮT và chờ mạch xả hết điện dư
+  digitalWrite(RED1, LOW);
+  digitalWrite(RED2, LOW);
+  digitalWrite(RED3, LOW);
+  digitalWrite(RED4, LOW);
+  digitalWrite(BUZZER, LOW);
+  delay(50); // Chờ 50ms để tụ điện ký sinh xả hết hoàn toàn
+
+  // Bước 2: Test từng chân, đọc 3 lần liên tiếp để xác nhận
+  auto testLoad = [](int pin) -> int {
+    int failCount = 0;
+    for (int i = 0; i < 3; i++) {
+      pinMode(pin, INPUT_PULLUP);
+      delay(10); // Chờ 10ms mỗi lần cho ổn định
+      int state = digitalRead(pin);
+      if (state == HIGH) failCount++;
+      pinMode(pin, OUTPUT);
+      digitalWrite(pin, LOW);
+      delay(5);
+    }
+    // Chỉ báo lỗi khi CẢ 3 LẦN đều đọc được HIGH (đứt mạch thật sự)
+    return (failCount >= 3) ? HIGH : LOW;
+  };
+
+  int red1State = testLoad(RED1);
+  int red2State = testLoad(RED2);
+  int red3State = testLoad(RED3);
+  int red4State = testLoad(RED4);
+  int buzzerState = testLoad(BUZZER);
+  
+  Serial.printf("Cold Test State -> R1:%d R2:%d R3:%d R4:%d BZ:%d\n", red1State, red2State, red3State, red4State, buzzerState);
+  
+  if (red1State == HIGH || red2State == HIGH || red3State == HIGH || red4State == HIGH) {
+    setError("COLD_TEST_FAIL_RED_LIGHT_OPEN");
+  }
+  if (buzzerState == HIGH) {
+    setError("COLD_TEST_FAIL_BUZZER_OPEN");
+  }
+  
+  lastColdTestTime = millis();
+}
+
 //======================================================
 // SETUP
 //======================================================
@@ -1499,7 +1739,6 @@ void setup()
   barrier1.write(90);
   barrier2.write(90);
 
-
   // WIFI
   WiFi.begin(ssid, password);
 
@@ -1517,6 +1756,8 @@ void setup()
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
 
+  mqttClient.setServer(mqtt_server, mqtt_port);
+
   // Cấu hình đồng bộ thời gian từ Internet (Múi giờ Việt Nam: UTC+7)
   configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.println("Da dong bo thoi gian thuc qua NTP");
@@ -1528,7 +1769,7 @@ void setup()
   server.on("/status", handleStatus);
   server.on("/history", handleHistory);
 
-  // MANUAL CONTROL
+  // ERROR CHECK CONTROL
   server.on("/open1", handleOpen1);
   server.on("/close1", handleClose1);
 
@@ -1545,6 +1786,7 @@ void setup()
 
 
   server.on("/resetError", handleResetError);
+  server.on("/confirmOK",  handleConfirmOK);
 
   server.on("/resetESP", handleResetESP);
 
@@ -1560,7 +1802,26 @@ void setup()
 void loop()
 {
   server.handleClient();
-
+  
+  // MQTT Keep-alive & Heartbeat
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    }
+    mqttClient.loop();
+    
+    // Heartbeat định kỳ
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+      publishStatusToMQTT();
+    }
+    
+    // Cập nhật trạng thái ngay lập tức khi có thay đổi
+    String currentStatus = getTrainStatus() + getGateStatus() + getMode() + errorMessage;
+    if (currentStatus != lastStatusStr) {
+      publishStatusToMQTT();
+      lastStatusStr = currentStatus;
+    }
+  }
 
   int ir1 = digitalRead(IR1);
   int ir2 = digitalRead(IR2);
@@ -1584,7 +1845,7 @@ void loop()
 
 
   //====================================================
-  // MANUAL RED BLINK
+  // ERROR CHECK RED BLINK
   //====================================================
 
   if(systemError)
@@ -1598,10 +1859,19 @@ void loop()
 
 
   //====================================================
-  // KHI LỖI -> CHỈ CHO PHÉP MANUAL
+  // FAIL_SAFE_MODE: chỉ giữ nguyên đầu ra, không làm gì thêm
   //====================================================
 
-  if(mode == MANUAL_MODE)
+  if(mode == FAIL_SAFE_MODE)
+  {
+    return;
+  }
+
+  //====================================================
+  // ERROR_CHECK_MODE: cho phép điều khiển tay, bỏ qua auto logic
+  //====================================================
+
+  if(mode == ERROR_CHECK_MODE)
   {
     return;
   }
@@ -1618,12 +1888,24 @@ void loop()
   checkIRActive(ir1, ir2);
 
 
-  // Sau khi check lỗi có thể đã chuyển Manual
-  if(mode == MANUAL_MODE)
+  // Sau khi check lỗi có thể đã chuyển FAIL_SAFE
+  if(mode == FAIL_SAFE_MODE)
   {
     return;
   }
 
+
+  //====================================================
+  // KIỂM TRA NGUỘI KHI KHÔNG CÓ TÀU
+  //====================================================
+  // Chỉ chạy cold test khi hệ thống đã ở trạng thái NO_TRAIN ổn định ít nhất 5 giây
+  // để tránh báo lỗi giả do đèn vừa chuyển trạng thái
+  if (trainState == NO_TRAIN 
+      && noTrainSince != 0 
+      && millis() - noTrainSince >= 5000
+      && millis() - lastColdTestTime >= COLD_TEST_INTERVAL) {
+      runColdTest();
+  }
 
   //====================================================
   // PHÁT HIỆN TÀU ĐẾN IR1
@@ -1633,6 +1915,7 @@ void loop()
      ir1Detected)
   {
     trainState = TRAIN_COMING;
+    noTrainSince = 0; // Reset timer vì đã có tàu
 
     trainDetectTime = millis();
     trainArrivalEpoch = time(NULL);
@@ -1743,7 +2026,7 @@ void loop()
 
 
   //====================================================
-  // MỞ BARRIER KHI IR2 KHÔNG CÒN TÍN HIỆU
+  // MỞ BARRIER KHI IR2 KHÔNG CÒN TÍN HIỆU TRONG 2 GIÂY
   //====================================================
 
   if(trainState == TRAIN_LEAVING)
@@ -1752,14 +2035,21 @@ void loop()
 
     redBlink();
 
-    // Giữ trạng thái đóng cho tới khi IR2 hết tín hiệu (HIGH)
-    if(ir2 == HIGH)
+    if(ir2 == LOW)
+    {
+      // Nếu tàu vẫn còn che IR2, reset lại timer
+      trainLeaveTime = millis();
+    }
+
+    // Giữ trạng thái đóng cho tới khi IR2 hết tín hiệu (HIGH) liên tục > 2000ms
+    if(ir2 == HIGH && (millis() - trainLeaveTime >= 2000))
     {
       openBarrier();
 
       warningOff();
 
       trainState = NO_TRAIN;
+      noTrainSince = millis(); // Bắt đầu đếm thời gian ổn định
 
       Serial.println("SYSTEM READY");
     }
